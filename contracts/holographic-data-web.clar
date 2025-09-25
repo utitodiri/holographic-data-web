@@ -514,3 +514,262 @@
   )
 )
 
+;; Detects and flags suspicious activity patterns
+(define-public (report-suspicious-activity 
+  (target-record uint)
+  (activity-type (string-ascii 32))
+  (severity-level uint)
+  (evidence-hash (buff 32))
+  (reporter-notes (string-ascii 256))
+)
+  (let
+    (
+      (record-data (unwrap! (map-get? quantum-storage-vault { record-id: target-record }) RECORD_NOT_FOUND_ERROR))
+      (report-id (+ (var-get total-records-counter) (* block-height u3)))
+      (max-severity u10)
+    )
+    ;; Suspicious activity validation
+    (asserts! (record-exists-in-vault? target-record) RECORD_NOT_FOUND_ERROR)
+    (asserts! (> (len activity-type) u0) ENCODING_STANDARD_VIOLATION)
+    (asserts! (< (len activity-type) u33) ENCODING_STANDARD_VIOLATION)
+    (asserts! (> severity-level u0) CAPACITY_THRESHOLD_EXCEEDED)
+    (asserts! (<= severity-level max-severity) CAPACITY_THRESHOLD_EXCEEDED)
+    (asserts! (> (len evidence-hash) u0) ENCODING_STANDARD_VIOLATION)
+    (asserts! (> (len reporter-notes) u0) ENCODING_STANDARD_VIOLATION)
+    (asserts! (< (len reporter-notes) u257) ENCODING_STANDARD_VIOLATION)
+
+    ;; Log suspicious activity report
+    (map-insert suspicious-activity-registry
+      { report-id: report-id }
+      {
+        target-record: target-record,
+        reporter-principal: tx-sender,
+        activity-type: activity-type,
+        severity-level: severity-level,
+        report-block: block-height,
+        evidence-hash: evidence-hash,
+        reporter-notes: reporter-notes,
+        investigation-status: "pending"
+      }
+    )
+    (ok report-id)
+  )
+)
+
+;; Suspicious activity tracking storage
+(define-map suspicious-activity-registry
+  { report-id: uint }
+  {
+    target-record: uint,
+    reporter-principal: principal,
+    activity-type: (string-ascii 32),
+    severity-level: uint,
+    report-block: uint,
+    evidence-hash: (buff 32),
+    reporter-notes: (string-ascii 256),
+    investigation-status: (string-ascii 16)
+  }
+)
+
+;; Implements time-locked modifications for enhanced security
+(define-public (schedule-time-locked-modification 
+  (record-id uint)
+  (unlock-block uint)
+  (new-metadata (string-ascii 128))
+  (modification-hash (buff 32))
+)
+  (let
+    (
+      (record-data (unwrap! (map-get? quantum-storage-vault { record-id: record-id }) RECORD_NOT_FOUND_ERROR))
+      (timelock-id (+ (var-get total-records-counter) (* block-height u2)))
+      (minimum-lock-period u144) ;; ~24 hours in blocks
+    )
+    ;; Time-lock validation
+    (asserts! (record-exists-in-vault? record-id) RECORD_NOT_FOUND_ERROR)
+    (asserts! (is-eq (get creator-principal record-data) tx-sender) OWNER_VERIFICATION_FAILED)
+    (asserts! (> unlock-block block-height) CAPACITY_THRESHOLD_EXCEEDED)
+    (asserts! (>= (- unlock-block block-height) minimum-lock-period) CAPACITY_THRESHOLD_EXCEEDED)
+    (asserts! (check-metadata-integrity new-metadata) METADATA_VALIDATION_ERROR)
+    (asserts! (> (len modification-hash) u0) ENCODING_STANDARD_VIOLATION)
+
+    ;; Schedule time-locked modification
+    (map-insert timelock-modification-vault
+      { timelock-id: timelock-id }
+      {
+        target-record: record-id,
+        unlock-block: unlock-block,
+        scheduled-by: tx-sender,
+        creation-block: block-height,
+        new-metadata: new-metadata,
+        modification-hash: modification-hash,
+        is-executed: false
+      }
+    )
+    (ok timelock-id)
+  )
+)
+
+;; Time-locked modification storage
+(define-map timelock-modification-vault
+  { timelock-id: uint }
+  {
+    target-record: uint,
+    unlock-block: uint,
+    scheduled-by: principal,
+    creation-block: uint,
+    new-metadata: (string-ascii 128),
+    modification-hash: (buff 32),
+    is-executed: bool
+  }
+)
+
+;; Creates comprehensive audit trail for record access
+(define-public (log-record-access 
+  (record-id uint)
+  (access-type (string-ascii 32))
+  (access-details (string-ascii 128))
+)
+  (let
+    (
+      (record-data (unwrap! (map-get? quantum-storage-vault { record-id: record-id }) RECORD_NOT_FOUND_ERROR))
+      (audit-entry-id (+ (var-get total-records-counter) block-height))
+      (has-permission (default-to false
+        (get access-granted 
+          (map-get? permission-access-registry { record-id: record-id, user-principal: tx-sender })
+        )
+      ))
+    )
+    ;; Access validation and logging
+    (asserts! (record-exists-in-vault? record-id) RECORD_NOT_FOUND_ERROR)
+    (asserts! (or has-permission 
+                  (is-eq (get creator-principal record-data) tx-sender)
+                  (is-eq tx-sender system-admin-principal)) ACCESS_PERMISSION_DENIED)
+    (asserts! (> (len access-type) u0) ENCODING_STANDARD_VIOLATION)
+    (asserts! (< (len access-type) u33) ENCODING_STANDARD_VIOLATION)
+    (asserts! (> (len access-details) u0) ENCODING_STANDARD_VIOLATION)
+    (asserts! (< (len access-details) u129) ENCODING_STANDARD_VIOLATION)
+
+    ;; Log access event
+    (map-insert access-audit-trail
+      { audit-entry-id: audit-entry-id }
+      {
+        record-id: record-id,
+        accessor-principal: tx-sender,
+        access-type: access-type,
+        access-block: block-height,
+        access-details: access-details,
+        record-frequency: (get frequency-value record-data)
+      }
+    )
+    (ok audit-entry-id)
+  )
+)
+
+;; Audit trail storage for access events
+(define-map access-audit-trail
+  { audit-entry-id: uint }
+  {
+    record-id: uint,
+    accessor-principal: principal,
+    access-type: (string-ascii 32),
+    access-block: uint,
+    access-details: (string-ascii 128),
+    record-frequency: uint
+  }
+)
+
+;; Multi-signature authorization for critical operations
+(define-public (create-multisig-authorization 
+  (record-id uint)
+  (operation-type (string-ascii 32))
+  (required-signatures uint)
+  (authorized-signers (list 5 principal))
+)
+  (let
+    (
+      (record-data (unwrap! (map-get? quantum-storage-vault { record-id: record-id }) RECORD_NOT_FOUND_ERROR))
+      (authorization-id (+ (var-get total-records-counter) u1000000))
+    )
+    ;; Authorization validation
+    (asserts! (record-exists-in-vault? record-id) RECORD_NOT_FOUND_ERROR)
+    (asserts! (is-eq (get creator-principal record-data) tx-sender) OWNER_VERIFICATION_FAILED)
+    (asserts! (> required-signatures u0) CAPACITY_THRESHOLD_EXCEEDED)
+    (asserts! (<= required-signatures u5) CAPACITY_THRESHOLD_EXCEEDED)
+    (asserts! (>= (len authorized-signers) required-signatures) CAPACITY_THRESHOLD_EXCEEDED)
+    (asserts! (> (len operation-type) u0) ENCODING_STANDARD_VIOLATION)
+    (asserts! (< (len operation-type) u33) ENCODING_STANDARD_VIOLATION)
+
+    ;; Create multi-signature authorization
+    (map-insert multisig-authorization-vault
+      { authorization-id: authorization-id }
+      {
+        target-record: record-id,
+        operation-type: operation-type,
+        required-signatures: required-signatures,
+        authorized-signers: authorized-signers,
+        current-signatures: u0,
+        creation-block: block-height,
+        is-executed: false
+      }
+    )
+    (ok authorization-id)
+  )
+)
+
+;; Multi-signature authorization storage
+(define-map multisig-authorization-vault
+  { authorization-id: uint }
+  {
+    target-record: uint,
+    operation-type: (string-ascii 32),
+    required-signatures: uint,
+    authorized-signers: (list 5 principal),
+    current-signatures: uint,
+    creation-block: uint,
+    is-executed: bool
+  }
+)
+
+;; Emergency freeze mechanism for compromised records
+(define-public (emergency-freeze-record (record-id uint) (freeze-reason (string-ascii 128)))
+  (let
+    (
+      (record-data (unwrap! (map-get? quantum-storage-vault { record-id: record-id }) RECORD_NOT_FOUND_ERROR))
+      (is-owner (is-eq (get creator-principal record-data) tx-sender))
+      (is-admin (is-eq tx-sender system-admin-principal))
+    )
+    ;; Security validation
+    (asserts! (record-exists-in-vault? record-id) RECORD_NOT_FOUND_ERROR)
+    (asserts! (or is-owner is-admin) OWNER_VERIFICATION_FAILED)
+    (asserts! (> (len freeze-reason) u0) ENCODING_STANDARD_VIOLATION)
+    (asserts! (< (len freeze-reason) u129) ENCODING_STANDARD_VIOLATION)
+
+    ;; Create freeze entry in emergency registry
+    (map-insert emergency-freeze-registry
+      { record-id: record-id }
+      { 
+        frozen-by: tx-sender,
+        freeze-block: block-height,
+        freeze-reason: freeze-reason,
+        is-active: true
+      }
+    )
+
+    ;; Revoke all permissions for frozen record
+    (map-delete permission-access-registry { record-id: record-id, user-principal: (get creator-principal record-data) })
+    (ok true)
+  )
+)
+
+;; Emergency freeze registry for compromised records
+(define-map emergency-freeze-registry
+  { record-id: uint }
+  {
+    frozen-by: principal,
+    freeze-block: uint,
+    freeze-reason: (string-ascii 128),
+    is-active: bool
+  }
+)
+
+
